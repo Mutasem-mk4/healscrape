@@ -1,0 +1,18 @@
+# Reusable site profile: merges top-level `selectors` with JSON Schema properties.
+site: demo_shop
+render: false
+selectors:
+  title: "h1"
+  price: ".price"
+schema:
+  type: object
+  required: [title, price]
+  properties:
+    title:
+      type: string
+      x-healscrape:
+        required: true
+    price:
+      type: string
+      x-healscrape:
+        required: true

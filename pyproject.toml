@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "healscrape"
+version = "0.1.0"
+description = "Self-healing AI-assisted structured web scraping CLI"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "healscrape contributors" }]
+dependencies = [
+  "typer[all]>=0.12.3",
+  "pydantic>=2.6",
+  "pydantic-settings>=2.2",
+  "httpx[http2]>=0.27",
+  "selectolax>=0.3.21",
+  "sqlalchemy>=2.0.29",
+  "alembic>=1.13",
+  "structlog>=24.1",
+  "jsonschema>=4.21",
+  "pyyaml>=6.0",
+  "google-generativeai>=0.8.3",
+  "tenacity>=8.2",
+  "python-dotenv>=1.0",
+  "rich>=13.7",
+]
+
+[project.optional-dependencies]
+browser = ["playwright>=1.44"]
+postgres = ["psycopg2-binary>=2.9"]
+dev = [
+  "pytest>=8.1",
+  "pytest-asyncio>=0.23",
+  "pytest-cov>=5.0",
+  "ruff>=0.4",
+]
+
+[project.scripts]
+scrape = "healscrape.cli.main:run"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

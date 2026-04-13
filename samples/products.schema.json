@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProductCard",
+  "type": "object",
+  "required": ["title", "price"],
+  "properties": {
+    "title": {
+      "type": "string",
+      "description": "Product name",
+      "x-healscrape": {
+        "selector": "h1.product-title",
+        "required": true
+      }
+    },
+    "price": {
+      "type": "string",
+      "description": "Displayed price text",
+      "x-healscrape": {
+        "selector": ".price",
+        "required": true
+      }
+    },
+    "link": {
+      "type": "string",
+      "description": "Canonical product URL if available",
+      "x-healscrape": {
+        "selector": "a.product-link",
+        "attr": "href",
+        "required": false
+      }
+    }
+  }
+}
