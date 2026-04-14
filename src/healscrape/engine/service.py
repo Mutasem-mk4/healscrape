@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -10,7 +11,8 @@ from sqlalchemy.orm import Session
 
 from healscrape.config import Settings
 from healscrape.domain.schema_spec import ExtractSpec
-from healscrape.engine.extract import extract_from_spec_map
+from healscrape.engine.extract import extract_from_spec_fields
+from healscrape.engine.llm_merge import merge_llm_fallback
 from healscrape.engine.heal_context import build_healing_user_prompt, sha256_bytes
 from healscrape.engine.validate import ValidationReport, validate_extraction
 from healscrape.exit_codes import (
@@ -39,14 +41,16 @@ log = structlog.get_logger(__name__)
 HEALING_SYSTEM_PROMPT = """You are a precise web scraping repair assistant.
 Return ONLY valid JSON with this shape:
 {
-  "extracted": { "<field>": "<value>" , ... },
-  "selectors": { "<field>": { "css": "<css selector>", "attr": "<attribute name or null>" } },
+  "extracted": { "<field_name>": "<value>" , ... },
+  "selectors": { "<field_name>": { "css": "<css selector>", "attr": "<attribute name or null>" } },
   "notes": "<short rationale>"
 }
 Rules:
+- Keys in "extracted" and "selectors" MUST use the schema field "name" (property key), not dotted json_path.
 - Prefer robust, specific CSS selectors that match the visible content.
 - If a field should use an attribute (e.g. href), set attr accordingly; otherwise attr must be null.
 - Do not invent data that is not supported by the provided page context.
+- If you cannot find a reliable CSS selector but can read a value from the provided context, still return it in "extracted"; the pipeline may accept evidence-grounded values even when selectors are wrong.
 """
 
 
@@ -171,8 +175,7 @@ def run_scrape(
             error=str(e),
         )
 
-    field_order = [f.name for f in spec.fields]
-    data = extract_from_spec_map(html, selector_map, field_order)
+    data = extract_from_spec_fields(html, selector_map, spec.fields)
     report = validate_extraction(data, spec)
     trace["steps"].append(
         {"step": "deterministic", "fetch_mode": mode, "data": data, "validation": json.loads(report.to_json())}
@@ -236,6 +239,7 @@ def run_scrape(
         fields_meta = [
             {
                 "name": f.name,
+                "json_path": f.json_path,
                 "required": f.required,
                 "type": f.json_type,
                 "description": f.description,
@@ -296,34 +300,54 @@ def run_scrape(
                 normalized[k] = {"css": v.get("css"), "attr": v.get("attr")}
 
         merged_for_test = _merge_selectors(base_selectors, normalized)
-        repaired = extract_from_spec_map(html, merged_for_test, field_order)
-        pass1 = validate_extraction(repaired, spec)
-        repaired_again = extract_from_spec_map(html, merged_for_test, field_order)
-        pass2 = validate_extraction(repaired_again, spec)
+        dom_repaired = extract_from_spec_fields(html, merged_for_test, spec.fields)
+        merged_output, llm_fallback_fields = merge_llm_fallback(
+            dom_repaired, llm_data, spec.fields, html
+        )
+        vr_merged = validate_extraction(merged_output, spec)
+        vr_dom = validate_extraction(dom_repaired, spec)
+
+        with tempfile.NamedTemporaryFile("wb", delete=False, suffix=".html") as tf:
+            tf.write(html.encode("utf-8"))
+            tmp_path = tf.name
+        try:
+            html_from_disk = Path(tmp_path).read_text(encoding="utf-8")
+            dom_replay = extract_from_spec_fields(html_from_disk, merged_for_test, spec.fields)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+        replay_ok = dom_replay == dom_repaired
 
         trace["steps"].append(
             {
                 "step": "post_heal_validation",
-                "repaired": repaired,
-                "pass1": json.loads(pass1.to_json()),
-                "pass2": json.loads(pass2.to_json()),
+                "dom_repaired": dom_repaired,
+                "merged_output": merged_output,
+                "llm_fallback_fields": llm_fallback_fields,
+                "vr_dom": json.loads(vr_dom.to_json()),
+                "vr_merged": json.loads(vr_merged.to_json()),
+                "replay_ok": replay_ok,
             }
         )
 
+        min_conf = settings.min_promotion_confidence
         can_promote = (
-            pass1.ok
-            and pass2.ok
-            and pass1.confidence >= settings.min_promotion_confidence
-            and pass2.confidence >= settings.min_promotion_confidence
+            vr_dom.ok
+            and vr_merged.ok
+            and replay_ok
+            and vr_dom.confidence >= min_conf
+            and vr_merged.confidence >= min_conf
         )
         blocked = None
         promoted_version_id = None
         if not can_promote:
-            if not pass1.ok:
-                blocked = "first_validation_failed"
-            elif not pass2.ok:
-                blocked = "second_validation_failed"
-            elif pass1.confidence < settings.min_promotion_confidence:
+            if not vr_merged.ok:
+                blocked = "merged_validation_failed"
+            elif not vr_dom.ok:
+                blocked = "promotion_blocked_dom_extraction_invalid"
+            elif not replay_ok:
+                blocked = "snapshot_replay_mismatch"
+            elif vr_dom.confidence < min_conf:
                 blocked = "confidence_below_threshold"
 
         sel_repo = SelectorRepository(session)
@@ -336,7 +360,7 @@ def run_scrape(
                 persist_selectors,
                 SelectorStatus.promoted,
                 parent_id=parent.id if parent else None,
-                confidence=pass1.confidence,
+                confidence=vr_dom.confidence,
             )
             promoted_version_id = new_ver.id
             AuditRepository(session).write(
@@ -355,10 +379,10 @@ def run_scrape(
                 confidence=None,
             )
 
-        outcome = RunOutcome.success if pass1.ok else RunOutcome.validation_failed
-        exit_code = SUCCESS if pass1.ok else VALIDATION_FAILED
-        final_data = repaired
-        final_report = pass1
+        outcome = RunOutcome.success if vr_merged.ok else RunOutcome.validation_failed
+        exit_code = SUCCESS if vr_merged.ok else VALIDATION_FAILED
+        final_data = merged_output
+        final_report = vr_merged
 
         active_selector_row_id = promoted_version_id or (parent.id if parent else None)
 
@@ -384,8 +408,8 @@ def run_scrape(
             llm_prompt_excerpt=user_prompt[:8000],
             llm_raw_response=raw,
             candidate_selectors_json=json.dumps(normalized, ensure_ascii=False),
-            validation_pass_1_ok=pass1.ok,
-            validation_pass_2_ok=pass2.ok,
+            validation_pass_1_ok=vr_merged.ok,
+            validation_pass_2_ok=replay_ok,
             promotion_blocked_reason=blocked,
             promoted_selector_version_id=promoted_version_id,
         )
@@ -405,7 +429,7 @@ def run_scrape(
             validation=final_report,
             run_public_id=str(run.public_id),
             trace_path=str(trace_path),
-            error=None if pass1.ok else "validation_failed_after_heal",
+            error=None if vr_merged.ok else "validation_failed_after_heal",
         )
 
     # No healing path

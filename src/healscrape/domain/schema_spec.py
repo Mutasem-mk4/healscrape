@@ -18,7 +18,7 @@ class FieldSelectorHint(BaseModel):
 
 class ExtractFieldSpec(BaseModel):
     name: str
-    json_path: str  # dotted path in output object, e.g. "title"
+    json_path: str  # dotted path in output object; LLM keys still use `name`
     json_type: str = "string"
     selector: str | None = None
     attr: str | None = None

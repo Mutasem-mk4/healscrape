@@ -2,18 +2,26 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Optional
 
-import typer
 import structlog
+import typer
 from rich.console import Console
+from rich.panel import Panel
+
+from healscrape import __version__
+from healscrape.cli.quick_runner import looks_like_http_url, run_quick
+from healscrape.cli.setup_wizard import run_setup
+from healscrape.cli.starters import STARTER_PROFILE, STARTER_SCHEMA
+from healscrape.cli.ux import print_quick_table, print_run_footer, resolve_config_arg
 from healscrape.config import load_settings
 from healscrape.engine.service import inspect_page, run_scrape
 from healscrape.exit_codes import CONFIG_ERROR, NOT_FOUND, SUCCESS
 from healscrape.logging_setup import configure_logging
-from healscrape.output.sinks import format_output
+from healscrape.output.sinks import emit_structured_result
 from healscrape.persistence.bootstrap import upgrade_database
 from healscrape.persistence.db import make_engine, make_session_factory
 from healscrape.persistence.repositories import ProfileRepository, RunRepository, SelectorRepository, SiteRepository
@@ -24,11 +32,27 @@ from healscrape.spec.loaders import load_extract_spec_from_schema_file, load_pro
 console = Console(stderr=True)
 log = structlog.get_logger(__name__)
 
+APP_HELP = """\
+[bold]healscrape[/bold] — scrape pages into structured JSON (deterministic first, optional AI repair).
+
+[bold]Fastest start[/bold]
+  [cyan]scrape[/cyan] https://example.com               [dim]# same as: scrape quick URL[/dim]
+  [cyan]scrape setup[/cyan]                             [dim]# interactive wizard (.env + starters)[/dim]
+  [cyan]scrape quick[/cyan] https://example.com         [dim]# explicit quick mode[/dim]
+  [cyan]scrape init[/cyan]                              [dim]# starter schema files only[/dim]
+  [cyan]scrape extract[/cyan] URL page.schema.json     [dim]# your own schema[/dim]
+
+[bold]More[/bold]  [cyan]scrape inspect[/cyan], [cyan]scrape heal[/cyan], [cyan]scrape doctor[/cyan], [cyan]scrape --help[/cyan]
+"""
+
 app = typer.Typer(
     name="scrape",
-    help="healscrape — deterministic-first, self-healing structured extraction CLI.",
-    no_args_is_help=True,
+    help=APP_HELP,
+    invoke_without_command=True,
+    no_args_is_help=False,
     pretty_exceptions_enable=True,
+    rich_markup_mode="rich",
+    add_completion=False,
 )
 
 
@@ -52,7 +76,19 @@ def _llm_factory():
 
 def _one_of_schema_profile(schema: Optional[Path], profile: Optional[Path]) -> None:
     if (schema is None) == (profile is None):
-        raise typer.BadParameter("Provide exactly one of --schema or --profile.")
+        raise typer.BadParameter(
+            "Missing schema or profile. Try:  scrape https://…  |  scrape init  |  scrape setup  |  "
+            "scrape extract YOUR_URL page.schema.json"
+        )
+
+
+def _register_profile_if_needed(settings, profile_path: Path | None, site_slug: str, body: str) -> None:
+    if profile_path is None or not body:
+        return
+    engine = make_engine(settings)
+    sf = make_session_factory(engine)
+    with session_scope(sf) as session:
+        ProfileRepository(session).upsert(site_slug, body)
 
 
 @app.callback()
@@ -65,40 +101,181 @@ def main(
         "--data-dir",
         help="Override HEALSCRAPE_DATA_DIR for this invocation.",
     ),
+    version: bool = typer.Option(False, "--version", "-V", help="Print version and exit."),
 ) -> None:
     """Global options apply to all subcommands."""
+    if version:
+        console.print(f"healscrape {__version__}")
+        raise typer.Exit(SUCCESS)
     if data_dir is not None:
         os.environ["HEALSCRAPE_DATA_DIR"] = str(data_dir.expanduser().resolve())
     configure_logging(json_logs=json_logs, level=log_level)
-    if ctx.invoked_subcommand is None:
+
+    if ctx.invoked_subcommand is not None:
         return
+
+    extras = list(ctx.args or ())
+    if not extras:
+        console.print(ctx.get_help())
+        raise typer.Exit(0)
+
+    first = extras[0].strip()
+    if looks_like_http_url(first):
+        if len(extras) > 1:
+            console.print("[yellow]Note:[/yellow] ignoring extra arguments after the URL.")
+        code = run_quick(
+            first,
+            save=False,
+            table=False,
+            no_heal=True,
+            output="json",
+            llm_factory=_llm_factory,
+            session_scope=session_scope,
+            console=console,
+            print_quick_table=print_quick_table,
+            print_run_footer=print_run_footer,
+        )
+        raise typer.Exit(code)
+
+    console.print(f"[red]Unknown:[/red] {first!r} — expected a URL starting with http:// or https://")
+    console.print("[dim]Try:[/dim] scrape --help  |  scrape setup  |  scrape init")
+    raise typer.Exit(CONFIG_ERROR)
+
+
+@app.command("quick")
+def quick_cmd(
+    url: Annotated[str, typer.Argument(help="Page URL.")],
+    table: Annotated[bool, typer.Option("--table", "-t", help="Show a table instead of JSON.")] = False,
+    save: Annotated[bool, typer.Option("--save", help="Persist run / snapshot / trace (needs DB).")] = False,
+    no_heal: Annotated[bool, typer.Option("--no-heal", help="With --save: disable Gemini healing.")] = False,
+    output: Annotated[str, typer.Option("--output", "-o", help="json | ndjson | csv")] = "json",
+) -> None:
+    """Grab common page fields with zero config (no schema file). Use --save for full audit trail."""
+    code = run_quick(
+        url,
+        save=save,
+        table=table,
+        no_heal=no_heal,
+        output=output,
+        llm_factory=None if no_heal else _llm_factory,
+        session_scope=session_scope,
+        console=console,
+        print_quick_table=print_quick_table,
+        print_run_footer=print_run_footer,
+    )
+    raise typer.Exit(code)
+
+
+@app.command("setup")
+def setup_cmd(
+    non_interactive: Annotated[
+        bool,
+        typer.Option("--non-interactive", help="Print setup hints only (no prompts)."),
+    ] = False,
+    env_file: Annotated[Path, typer.Option("--env-file", help="Where to write .env.")] = Path(".env"),
+    starters: Annotated[bool, typer.Option("--starters/--no-starters", help="Offer starter schema files.")] = True,
+    starters_dir: Annotated[
+        Path,
+        typer.Option("--starters-dir", help="Directory for page.schema.json + site.yaml."),
+    ] = Path("."),
+    force: Annotated[bool, typer.Option("--force", help="Overwrite existing starter files.")] = False,
+) -> None:
+    """Interactive first-run wizard: .env, data dir, optional Gemini key, starter files."""
+    raise typer.Exit(
+        run_setup(
+            env_file=env_file,
+            non_interactive=non_interactive,
+            with_starters=starters,
+            starters_dir=starters_dir,
+            force_starters=force,
+        )
+    )
+
+
+@app.command("init")
+def init_cmd(
+    directory: Annotated[Path, typer.Option("--dir", help="Folder to write starter files.", show_default=True)] = Path(
+        "."
+    ),
+    force: Annotated[bool, typer.Option("--force", help="Overwrite existing files.")] = False,
+) -> None:
+    """Create page.schema.json and site.yaml you can edit and pass to scrape extract."""
+    directory = directory.expanduser().resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    schema_path = directory / "page.schema.json"
+    yaml_path = directory / "site.yaml"
+    for p, content in ((schema_path, STARTER_SCHEMA), (yaml_path, STARTER_PROFILE)):
+        if p.exists() and not force:
+            console.print(f"[yellow]Skip[/yellow] (exists): {p}")
+            continue
+        p.write_text(content.strip() + "\n", encoding="utf-8")
+        console.print(f"[green]Wrote[/green] {p}")
+    console.print(
+        Panel.fit(
+            "[bold]Next[/bold]\n"
+            f"  scrape extract YOUR_URL [cyan]{schema_path.name}[/cyan]\n"
+            f"  scrape extract YOUR_URL [cyan]{yaml_path.name}[/cyan]\n"
+            "  [cyan]scrape setup[/cyan]  [dim](if you have not configured .env yet)[/dim]",
+            title="healscrape",
+        )
+    )
+    raise typer.Exit(SUCCESS)
+
+
+@app.command("doctor")
+def doctor_cmd() -> None:
+    """Check your environment (Python, API key, optional Playwright)."""
+    console.print(f"[bold]healscrape[/bold] {__version__}")
+    console.print(f"Python {sys.version.split()[0]}")
+    key = load_settings().gemini_api_key
+    console.print("GEMINI_API_KEY: [green]set[/green]" if key else "[yellow]not set[/yellow] (healing disabled)")
+    try:
+        import playwright  # noqa: F401
+
+        console.print("Playwright: [green]installed[/green]")
+    except ImportError:
+        console.print("Playwright: [dim]not installed[/dim] (pip install healscrape[browser])")
+    console.print("[dim]First time? Run[/dim] [cyan]scrape setup[/cyan] [dim]for a guided .env and starter files.[/dim]")
+    raise typer.Exit(SUCCESS)
 
 
 @app.command("extract")
 def extract_cmd(
     url: Annotated[str, typer.Argument(help="Target page URL.")],
+    config: Annotated[
+        Optional[Path],
+        typer.Argument(
+            help="Schema (.json) or profile (.yaml). Same as --schema / --profile.",
+            show_default=False,
+        ),
+    ] = None,
     schema: Annotated[Optional[Path], typer.Option("--schema", help="JSON Schema with x-healscrape hints.")] = None,
     profile: Annotated[Optional[Path], typer.Option("--profile", help="Site profile YAML.")] = None,
     render: Annotated[bool, typer.Option("--render", help="Render with Playwright (requires browser extra).")] = False,
     no_heal: Annotated[bool, typer.Option("--no-heal", help="Disable LLM healing on validation failure.")] = False,
-    output: Annotated[str, typer.Option("--output", help="json | ndjson | csv")] = "json",
+    output: Annotated[str, typer.Option("--output", "-o", help="json | ndjson | csv")] = "json",
+    quiet: Annotated[bool, typer.Option("--quiet", "-q", help="Less chatter on stderr.")] = False,
 ) -> None:
-    """Fetch a page, extract deterministically, validate, heal if needed, persist audit trail."""
+    """Fetch a page, extract, validate, heal if needed, persist audit trail."""
+    try:
+        schema, profile = resolve_config_arg(config, schema, profile)
+    except typer.BadParameter as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(CONFIG_ERROR) from e
     _one_of_schema_profile(schema, profile)
     settings = load_settings()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     upgrade_database(settings)
 
+    profile_body = ""
     if schema:
         spec = load_extract_spec_from_schema_file(schema)
     else:
         spec = load_profile_yaml(profile)  # type: ignore[arg-type]
-        if profile is not None:
-            body = profile.read_text(encoding="utf-8")
-            engine = make_engine(settings)
-            sf = make_session_factory(engine)
-            with session_scope(sf) as session:
-                ProfileRepository(session).upsert(spec.site_slug, body)
+        profile_body = profile.read_text(encoding="utf-8") if profile is not None else ""
+
+    if profile is not None and profile_body:
+        _register_profile_if_needed(settings, profile, spec.site_slug, profile_body)
 
     if render:
         spec.render = True
@@ -122,13 +299,13 @@ def extract_cmd(
                 output_format=output,
             )
         if res.data is not None:
-            console.print(format_output(res.data, output))
+            emit_structured_result(res.data, output)
         if res.error:
             console.print(f"[red]{res.error}[/red]")
         if res.validation and not res.validation.ok:
             console.print(f"[yellow]validation:[/yellow] {res.validation.to_json()}")
-        if res.run_public_id:
-            log.info("run_complete", run_id=res.run_public_id, exit=res.exit_code)
+        if not quiet:
+            print_run_footer(res, verb="Extract")
         raise typer.Exit(code=res.exit_code)
     finally:
         fetcher.close()
@@ -144,7 +321,7 @@ def inspect_cmd(
     fetcher = HttpFetcher(settings)
     try:
         info = inspect_page(url, settings, fetcher, render=render)
-        console.print(json.dumps(info, indent=2, ensure_ascii=False))
+        sys.stdout.write(json.dumps(info, indent=2, ensure_ascii=False) + "\n")
         raise typer.Exit(SUCCESS)
     finally:
         fetcher.close()
@@ -153,27 +330,36 @@ def inspect_cmd(
 @app.command("heal")
 def heal_cmd(
     url: Annotated[str, typer.Argument(help="Target page URL.")],
+    config: Annotated[
+        Optional[Path],
+        typer.Argument(help="Schema (.json) or profile (.yaml).", show_default=False),
+    ] = None,
     schema: Annotated[Optional[Path], typer.Option("--schema", help="JSON Schema path.")] = None,
     profile: Annotated[Optional[Path], typer.Option("--profile", help="Site profile YAML.")] = None,
     render: Annotated[bool, typer.Option("--render", help="Render with Playwright.")] = False,
-    output: Annotated[str, typer.Option("--output", help="json | ndjson | csv")] = "json",
+    output: Annotated[str, typer.Option("--output", "-o", help="json | ndjson | csv")] = "json",
+    quiet: Annotated[bool, typer.Option("--quiet", "-q", help="Less chatter on stderr.")] = False,
 ) -> None:
-    """Run extraction and allow healing when validation fails (same pipeline as extract with healing on)."""
+    """Same as extract with healing enabled (explicit command for operators)."""
+    try:
+        schema, profile = resolve_config_arg(config, schema, profile)
+    except typer.BadParameter as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(CONFIG_ERROR) from e
     _one_of_schema_profile(schema, profile)
     settings = load_settings()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     upgrade_database(settings)
 
+    profile_body = ""
     if schema:
         spec = load_extract_spec_from_schema_file(schema)
     else:
         spec = load_profile_yaml(profile)  # type: ignore[arg-type]
-        if profile is not None:
-            body = profile.read_text(encoding="utf-8")
-            engine = make_engine(settings)
-            sf = make_session_factory(engine)
-            with session_scope(sf) as session:
-                ProfileRepository(session).upsert(spec.site_slug, body)
+        profile_body = profile.read_text(encoding="utf-8") if profile is not None else ""
+
+    if profile is not None and profile_body:
+        _register_profile_if_needed(settings, profile, spec.site_slug, profile_body)
 
     if render:
         spec.render = True
@@ -196,9 +382,11 @@ def heal_cmd(
                 output_format=output,
             )
         if res.data is not None:
-            console.print(format_output(res.data, output))
+            emit_structured_result(res.data, output)
         if res.error:
             console.print(f"[red]{res.error}[/red]")
+        if not quiet:
+            print_run_footer(res, verb="Heal")
         raise typer.Exit(code=res.exit_code)
     finally:
         fetcher.close()
@@ -218,7 +406,7 @@ def profiles_list() -> None:
     with session_scope(sf) as session:
         names = ProfileRepository(session).list_names()
     for n in names:
-        console.print(n)
+        sys.stdout.write(n + "\n")
     raise typer.Exit(SUCCESS)
 
 
@@ -244,7 +432,7 @@ def selectors_show(
         if not sel:
             console.print("no_promoted_selectors")
             raise typer.Exit(NOT_FOUND)
-        console.print(sel.selectors_json)
+        sys.stdout.write(sel.selectors_json + "\n")
     raise typer.Exit(SUCCESS)
 
 
@@ -295,7 +483,7 @@ def runs_show(
                 for h in healing
             ],
         }
-        console.print(json.dumps(payload, indent=2, ensure_ascii=False))
+        sys.stdout.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
     raise typer.Exit(SUCCESS)
 
 

@@ -8,6 +8,7 @@ import jsonschema
 from jsonschema import Draft202012Validator
 
 from healscrape.domain.schema_spec import ExtractFieldSpec, ExtractSpec
+from healscrape.engine.json_path_util import get_at_path
 
 
 @dataclass
@@ -32,7 +33,7 @@ class ValidationReport:
 def field_level_checks(data: dict[str, Any], fields: list[ExtractFieldSpec]) -> list[str]:
     reasons: list[str] = []
     for f in fields:
-        val = data.get(f.name)
+        val = get_at_path(data, f.json_path)
         if f.required and (val is None or (isinstance(val, str) and val.strip() == "")):
             reasons.append(f"required_field_empty:{f.name}")
             continue
@@ -52,9 +53,9 @@ def compute_confidence(data: dict[str, Any], fields: list[ExtractFieldSpec]) -> 
     if not required:
         if not fields:
             return 1.0
-        filled = sum(1 for f in fields if _nonempty(data.get(f.name)))
+        filled = sum(1 for f in fields if _nonempty(get_at_path(data, f.json_path)))
         return filled / max(len(fields), 1)
-    filled = sum(1 for f in required if _nonempty(data.get(f.name)))
+    filled = sum(1 for f in required if _nonempty(get_at_path(data, f.json_path)))
     return filled / len(required)
 
 

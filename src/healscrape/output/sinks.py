@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import sys
 from typing import Any
 
 
@@ -24,3 +25,14 @@ def _to_csv_row(obj: dict[str, Any]) -> str:
     w.writeheader()
     w.writerow({k: "" if flat[k] is None else str(flat[k]) for k in flat})
     return buf.getvalue()
+
+
+def emit_structured_result(payload: dict[str, Any], fmt: str) -> None:
+    """Write machine-readable output to stdout (so `> out.json` and pipes work)."""
+    s = format_output(payload, fmt)
+    if fmt.lower() == "ndjson":
+        sys.stdout.write(s)
+        return
+    if not s.endswith("\n"):
+        s += "\n"
+    sys.stdout.write(s)

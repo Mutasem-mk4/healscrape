@@ -23,6 +23,7 @@ def schema_to_extract_spec(schema: dict[str, Any], site_slug: str) -> ExtractSpe
         hx = sub.get("x-healscrape") or {}
         sel = hx.get("selector")
         attr = hx.get("attr")
+        json_path = str(hx.get("json_path") or name)
         req = bool(hx.get("required")) or name in required_root
         jt = sub.get("type")
         if isinstance(jt, list):
@@ -32,7 +33,7 @@ def schema_to_extract_spec(schema: dict[str, Any], site_slug: str) -> ExtractSpe
         fields.append(
             ExtractFieldSpec(
                 name=name,
-                json_path=name,
+                json_path=json_path,
                 json_type=jt,
                 selector=sel,
                 attr=attr,
@@ -70,6 +71,7 @@ def load_profile_yaml(path: Path) -> ExtractSpec:
         hx = sub.get("x-healscrape") or {}
         sel = hx.get("selector") or selectors.get(name)
         attr = hx.get("attr")
+        json_path = str(hx.get("json_path") or name)
         req = bool(hx.get("required")) or name in required_root
         jt = sub.get("type")
         if isinstance(jt, list):
@@ -79,7 +81,7 @@ def load_profile_yaml(path: Path) -> ExtractSpec:
         fields.append(
             ExtractFieldSpec(
                 name=name,
-                json_path=name,
+                json_path=json_path,
                 json_type=jt,
                 selector=sel,
                 attr=attr,

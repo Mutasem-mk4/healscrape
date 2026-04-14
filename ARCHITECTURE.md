@@ -11,7 +11,7 @@
 
 | Layer | Responsibility |
 |-------|------------------|
-| `healscrape.cli` | Typer CLI, global logging, session lifecycle, output sinks |
+| `healscrape.cli` | Typer CLI (`invoke_without_command`: bare `scrape <https-url>` = quick), `setup` wizard, logging, stdout/stderr split |
 | `healscrape.providers.fetch` | httpx client, retries (Tenacity), rate limit, concurrency semaphore |
 | `healscrape.providers.browser` | Optional Playwright render |
 | `healscrape.providers.llm` | `LlmProvider` protocol; `GeminiProvider`; `MockLlmProvider` (tests) |
@@ -27,24 +27,28 @@
 ```mermaid
 flowchart TD
   A[Fetch or render HTML] --> B[Merge selectors: schema/profile + promoted version]
-  B --> C[Deterministic extract]
+  B --> C[Deterministic extract into json_path tree]
   C --> D{Valid?}
   D -->|yes| E[Persist run + snapshot + trace]
   D -->|no + healing allowed| F[Build bounded LLM context]
-  F --> G[Gemini JSON response]
-  G --> H[Normalize selectors + merge with base]
-  H --> I[Re-extract on snapshot]
-  I --> J[Validation pass 1]
-  J --> K[Re-extract again]
-  K --> L[Validation pass 2]
-  L --> M{Both OK + confidence threshold?}
-  M -->|yes| N[Promote new selector version + audit log]
-  M -->|no| O[Store draft version only + block reason]
-  O --> P[Persist healing event + run]
-  N --> P
-  E --> Q[Exit 0]
-  P --> R[Exit non-zero if still invalid]
+  F --> G[Gemini JSON: extracted + selectors]
+  G --> H[Merge candidate selectors with base map]
+  H --> I[DOM re-extract: dom_repaired]
+  I --> J[merge_llm_fallback: evidence-grounded fill from LLM when DOM empty]
+  J --> K[Validate merged output: user-facing success]
+  K --> L[Validate dom_repaired only: promotion gate]
+  L --> M[Write HTML to temp file, read back, re-extract: replay parity]
+  M --> N{dom valid + replay match + confidence?}
+  N -->|yes| O[Promote selector version + audit log]
+  N -->|no| P[Draft or no promotion + block reason]
+  P --> Q[Persist healing event + run]
+  O --> Q
+  E --> R[Exit 0]
+  Q --> S[Exit non-zero if merged validation still fails]
 ```
+
+- **`merged_output`**: DOM values plus LLM `extracted` fields only when the DOM slot was empty **and** the string appears in collapsed visible text (anti-hallucination).
+- **Promotion** requires **`dom_repaired` validates**, **`merged_output` validates**, **byte round-trip replay** extraction equals `dom_repaired`, and **confidence** thresholds — not merely repeating the same in-memory parse twice.
 
 ## Persistence model (SQLite by default)
 

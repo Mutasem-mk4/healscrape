@@ -21,6 +21,34 @@ def test_validate_success():
     assert r.confidence == 1.0
 
 
+def test_validate_nested_json_path():
+    spec = ExtractSpec(
+        site_slug="t",
+        fields=[
+            ExtractFieldSpec(
+                name="title",
+                json_path="product.title",
+                json_type="string",
+                required=True,
+                selector="h1",
+            ),
+        ],
+        json_schema={
+            "type": "object",
+            "required": ["product"],
+            "properties": {
+                "product": {
+                    "type": "object",
+                    "required": ["title"],
+                    "properties": {"title": {"type": "string"}},
+                }
+            },
+        },
+    )
+    r = validate_extraction({"product": {"title": "x"}}, spec)
+    assert r.ok
+
+
 def test_validate_required_missing():
     spec = ExtractSpec(
         site_slug="t",

@@ -17,19 +17,34 @@ cp .env.example .env   # add GEMINI_API_KEY when using healing
 alembic upgrade head   # optional if CLI auto-migrate is skipped
 ```
 
-The CLI entry point is **`scrape`**.
+The CLI entry point is **`scrape`**. Run **`scrape --help`** for built-in examples.
 
-## Quick start
+**Structured JSON / CSV / NDJSON is written to stdout** (human hints and errors to stderr), so this works:  
+`scrape quick https://example.com > page.json`
+
+## Easiest usage (no schema file, no database)
 
 ```bash
-# Structured extract + auto-heal on validation failure
-scrape extract "https://example.com/product/1" --schema samples/products.schema.json
+scrape https://example.com                    # same as: scrape quick … (JSON to stdout)
+scrape quick https://example.com              # explicit quick mode
+scrape quick https://example.com -t           # friendly table on stderr
+scrape quick https://example.com --save       # same fields + full persist / optional healing
+scrape setup                                  # guided wizard: .env, data dir, Gemini, starter files
+```
 
-# Static inspection (no DB writes)
+## Quick start (your own schema)
+
+```bash
+scrape init                                   # writes page.schema.json + site.yaml in current directory
+scrape extract "https://example.com/page" page.schema.json
+# same as: scrape extract URL --schema page.schema.json
+
+# Structured extract + auto-heal when validation fails (needs GEMINI_API_KEY)
+scrape extract "https://example.com/product/1" samples/products.schema.json
+
 scrape inspect "https://example.com"
-
-# Healing-focused command (same pipeline; healing runs when validation fails)
-scrape heal "https://example.com/product/1" --schema samples/products.schema.json
+scrape heal "https://example.com/product/1" samples/products.schema.json
+scrape doctor                                 # check Python, API key, Playwright
 
 # Operator queries
 scrape profiles list
@@ -84,7 +99,7 @@ docker run --rm -e GEMINI_API_KEY -e HEALSCRAPE_DATA_DIR=/data -v hsdata:/data h
 pytest tests -q
 ```
 
-Includes unit tests, DB integration, a fast deterministic E2E (mocked HTTP), and an E2E healing path with a **mock LLM** and HTML that simulates selector drift.
+Includes unit tests (validation, `json_path`, LLM merge/evidence), DB integration, a fast deterministic E2E (`test_e2e_fast.py`), healing + promotion (`test_e2e_healing_promotes_selectors.py`), **LLM value fallback when selectors stay broken** (`test_e2e_llm_fallback.py`), and a **second-run** check that promoted selectors work without the LLM (`test_e2e_healing_promotes_selectors.py::test_e2e_second_run_uses_promoted_selectors_without_llm`).
 
 ## Documentation
 
